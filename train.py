@@ -18,7 +18,7 @@ from nets.yolo_training import (YOLOLoss, get_lr_scheduler, set_optimizer_lr,
                                 weights_init)
 from utils.callbacks import EvalCallback, LossHistory
 from utils.dataloader import YoloDataset, yolo_dataset_collate
-from utils.utils import get_anchors, get_classes, show_config
+from utils.utils import download_weights, get_anchors, get_classes, show_config
 from utils.utils_fit import fit_one_epoch
 
 '''
@@ -291,8 +291,13 @@ if __name__ == "__main__":
     #   创建yolo模型
     #------------------------------------------------------#
     model = YoloBody(anchors_mask, num_classes, pretrained = pretrained)
-    if not pretrained:
-        weights_init(model)
+    if pretrained:
+        if distributed:
+            if local_rank == 0:
+                download_weights()  
+            dist.barrier()
+        else:
+            download_weights()
     if model_path != '':
         #------------------------------------------------------#
         #   权值文件请看README，百度网盘下载

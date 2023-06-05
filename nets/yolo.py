@@ -4,6 +4,40 @@ import torch
 import torch.nn as nn
 
 from nets.CSPdarknet import darknet53
+from nets.efficientnet import EfficientNet as EffNet
+
+
+class EfficientNet(nn.Module):
+    def __init__(self, phi, load_weights=False):
+        super(EfficientNet, self).__init__()
+        model = EffNet.from_pretrained(f'efficientnet-b{phi}', load_weights)
+        del model._conv_head
+        del model._bn1
+        del model._avg_pooling
+        del model._dropout
+        del model._fc
+        self.model = model
+
+    def forward(self, x):
+        x = self.model._conv_stem(x)
+        x = self.model._bn0(x)
+        x = self.model._swish(x)
+        feature_maps = []
+
+        last_x = None
+        for idx, block in enumerate(self.model._blocks):
+            drop_connect_rate = self.model._global_params.drop_connect_rate
+            if drop_connect_rate:
+                drop_connect_rate *= float(idx) / len(self.model._blocks)
+            x = block(x, drop_connect_rate=drop_connect_rate)
+            if block._depthwise_conv.stride == [2, 2]:
+                feature_maps.append(last_x)
+            elif idx == len(self.model._blocks) - 1:
+                feature_maps.append(x)
+            last_x = x
+        del last_x
+        out_feats = [feature_maps[2], feature_maps[3], feature_maps[4]]
+        return out_feats
 
 
 def conv2d(filter_in, filter_out, kernel_size, stride=1):
@@ -86,25 +120,26 @@ def yolo_head(filters_list, in_filters):
 class YoloBody(nn.Module):
     def __init__(self, anchors_mask, num_classes, pretrained = False):
         super(YoloBody, self).__init__()
-        #---------------------------------------------------#   
-        #   生成CSPdarknet53的主干模型
-        #   获得三个有效特征层，他们的shape分别是：
-        #   52,52,256
-        #   26,26,512
-        #   13,13,1024
         #---------------------------------------------------#
-        self.backbone   = darknet53(pretrained)
+        #   生成efficientnet的主干模型，以efficientnetB0为例
+        #   获得三个有效特征层，他们的shape分别是：
+        #   52, 52, 40
+        #   26, 26, 112
+        #   13, 13, 320
+        #---------------------------------------------------#
+        self.backbone = EfficientNet(0, load_weights=pretrained)
+        out_filters = [40, 112, 320]
 
-        self.conv1      = make_three_conv([512,1024],1024)
+        self.conv1      = make_three_conv([512,1024],out_filters[2])
         self.SPP        = SpatialPyramidPooling()
         self.conv2      = make_three_conv([512,1024],2048)
 
         self.upsample1          = Upsample(512,256)
-        self.conv_for_P4        = conv2d(512,256,1)
+        self.conv_for_P4        = conv2d(out_filters[1],256,1)
         self.make_five_conv1    = make_five_conv([256, 512],512)
 
         self.upsample2          = Upsample(256,128)
-        self.conv_for_P3        = conv2d(256,128,1)
+        self.conv_for_P3        = conv2d(out_filters[0],128,1)
         self.make_five_conv2    = make_five_conv([128, 256],256)
 
         # 3*(5+num_classes) = 3*(5+20) = 3*(4+1+20)=75
@@ -124,7 +159,12 @@ class YoloBody(nn.Module):
 
 
     def forward(self, x):
-        #  backbone
+        # --------------------------------------------------- #
+        # Obtain three effective feature layers, their shapes are:
+        # 52, 52, 40
+        # 26, 26, 112
+        # 13, 13, 320
+        # --------------------------------------------------- #
         x2, x1, x0 = self.backbone(x)
 
         # 13,13,1024 -> 13,13,512 -> 13,13,1024 -> 13,13,512 -> 13,13,2048 
@@ -165,20 +205,11 @@ class YoloBody(nn.Module):
         # 13,13,1024 -> 13,13,512 -> 13,13,1024 -> 13,13,512 -> 13,13,1024 -> 13,13,512
         P5 = self.make_five_conv4(P5)
 
-        #---------------------------------------------------#
-        #   第三个特征层
-        #   y3=(batch_size,75,52,52)
-        #---------------------------------------------------#
+        # P3: 52, 52, 128 =ConvBlock=> P3: 52, 52, 256 =1*1conv2d=> P3: 52, 52, num_anchors * (5 + num_classes)
         out2 = self.yolo_head3(P3)
-        #---------------------------------------------------#
-        #   第二个特征层
-        #   y2=(batch_size,75,26,26)
-        #---------------------------------------------------#
+        # P4: 26, 26, 256 =ConvBlock=> P4: 26, 26, 512 =1*1conv2d=> P4: 26, 26, num_anchors * (5 + num_classes)
         out1 = self.yolo_head2(P4)
-        #---------------------------------------------------#
-        #   第一个特征层
-        #   y1=(batch_size,75,13,13)
-        #---------------------------------------------------#
+        # P5: 13, 13, 512 =ConvBlock=> P5: 13, 13, 1024 =1*1conv2d=> P5: 13, 13, num_anchors * (5 + num_classes)
         out0 = self.yolo_head1(P5)
 
         return out0, out1, out2
